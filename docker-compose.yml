@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: 67note-bot
+    restart: unless-stopped
+    environment:
+      - WHISPER_MODEL=small
+      - FACE_THRESHOLD=0.35
+      - REQUIRE_FACE_MATCH=true
+      - REQUIRE_GESTURE=true
+      - GESTURE_STRICT=false
+    volumes:
+      - ./data:/app/data
+      - insightface_models:/root/.insightface
+      - whisper_cache:/root/.cache
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 1g
+
+volumes:
+  insightface_models:
+  whisper_cache:
