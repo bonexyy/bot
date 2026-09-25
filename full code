@@ -1,0 +1,723 @@
+"""
+67 Note Bot — единый файл.
+Включает: БД, аудио, лицо, жесты, логику бота.
+
+Запуск:
+    pip install -r requirements.txt
+    python bot.py
+"""
+
+import asyncio
+import logging
+import os
+import re
+import subprocess
+import tempfile
+from datetime import date, datetime
+from pathlib import Path
+from typing import Optional
+
+import aiosqlite
+import cv2
+import numpy as np
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import Message
+from faster_whisper import WhisperModel
+from insightface.app import FaceAnalysis
+
+# =====================================================================
+# КОНФИГ
+# =====================================================================
+
+BOT_TOKEN = "8922528058:AAG5TODMCykjLsLcOOGZoNRiHHnfdlCDHUE"
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small")
+DB_PATH = "data/users.db"
+
+# Проверки
+FACE_THRESHOLD = float(os.getenv("FACE_THRESHOLD", "0.35"))
+REQUIRE_FACE_MATCH = os.getenv("REQUIRE_FACE_MATCH", "true").lower() == "true"
+REQUIRE_GESTURE = os.getenv("REQUIRE_GESTURE", "true").lower() == "true"
+GESTURE_STRICT = os.getenv("GESTURE_STRICT", "false").lower() == "true"
+
+# Игровые константы
+COINS_PER_67 = 1
+MAX_PER_VIDEO = 3
+DAILY_LIMIT = 67
+MIN_DURATION = 5.7
+MAX_DURATION = 7.7
+BONUS_67_PER_DAY = 67
+DAILY_LOGIN_BONUS = 67
+
+# =====================================================================
+# ЛОГИ
+# =====================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("67note")
+
+# =====================================================================
+# МОДЕЛИ (ленивая загрузка)
+# =====================================================================
+
+_whisper_model: Optional[WhisperModel] = None
+_face_app: Optional[FaceAnalysis] = None
+
+
+def get_whisper() -> WhisperModel:
+    global _whisper_model
+    if _whisper_model is None:
+        log.info(f"Загружаю Whisper: {WHISPER_MODEL_NAME}...")
+        _whisper_model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+        log.info("Whisper готов.")
+    return _whisper_model
+
+
+def get_face_app() -> FaceAnalysis:
+    global _face_app
+    if _face_app is None:
+        log.info("Загружаю InsightFace (buffalo_l)...")
+        _face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+        _face_app.prepare(ctx_id=-1, det_size=(320, 320))
+        log.info("InsightFace готов.")
+    return _face_app
+
+
+# =====================================================================
+# БАЗА ДАННЫХ
+# =====================================================================
+
+async def init_db() -> None:
+    Path("data").mkdir(exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id        INTEGER PRIMARY KEY,
+                username       TEXT,
+                balance        INTEGER DEFAULT 0,
+                total_67       INTEGER DEFAULT 0,
+                streak         INTEGER DEFAULT 0,
+                last_login     TEXT,
+                face_embedding BLOB,
+                created_at     TEXT
+            );
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                user_id      INTEGER,
+                day          TEXT,
+                videos_count INTEGER DEFAULT 0,
+                coins_earned INTEGER DEFAULT 0,
+                bonus_67     INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, day)
+            );
+            CREATE TABLE IF NOT EXISTS seen_videos (
+                file_unique_id TEXT PRIMARY KEY,
+                user_id        INTEGER,
+                created_at     TEXT
+            );
+        """)
+        await db.commit()
+
+
+async def db_get_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
+            return await cur.fetchone()
+
+
+async def db_create_user(user_id: int, username: Optional[str]):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, balance, total_67, streak, created_at) "
+            "VALUES (?, ?, 0, 0, 0, ?)",
+            (user_id, username, datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+
+
+async def db_add_coins(user_id: int, amount: int, count_67: int = 0):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET balance = balance + ?, total_67 = total_67 + ? WHERE user_id = ?",
+            (amount, count_67, user_id),
+        )
+        await db.commit()
+
+
+async def db_get_daily(user_id: int, day: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM daily_stats WHERE user_id = ? AND day = ?",
+            (user_id, day),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def db_upsert_daily(user_id: int, day: str, videos: int = 0, coins: int = 0, bonus: int = 0):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO daily_stats (user_id, day, videos_count, coins_earned, bonus_67)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, day) DO UPDATE SET
+                videos_count = videos_count + excluded.videos_count,
+                coins_earned = coins_earned + excluded.coins_earned,
+                bonus_67     = bonus_67     + excluded.bonus_67
+        """, (user_id, day, videos, coins, bonus))
+        await db.commit()
+
+
+async def db_mark_video_seen(file_unique_id: str, user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "INSERT INTO seen_videos (file_unique_id, user_id, created_at) VALUES (?, ?, ?)",
+                (file_unique_id, user_id, datetime.utcnow().isoformat()),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def db_save_face(user_id: int, embedding_bytes: bytes):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET face_embedding = ? WHERE user_id = ?",
+            (embedding_bytes, user_id),
+        )
+        await db.commit()
+
+
+async def db_get_face(user_id: int) -> Optional[bytes]:
+    user = await db_get_user(user_id)
+    if user and user["face_embedding"]:
+        return bytes(user["face_embedding"])
+    return None
+
+
+# =====================================================================
+# АУДИО (Whisper)
+# =====================================================================
+
+PATTERN_67 = re.compile(
+    "|".join([
+        r"\b67\b",
+        r"\b6\s*7\b",
+        r"шестьдесят\s+семь",
+        r"шесть\s*семь",
+        r"six\s*seven",
+        r"sixseven",
+    ]),
+    re.IGNORECASE,
+)
+
+
+def extract_audio(video_path: str, audio_path: str) -> bool:
+    try:
+        subprocess.run(
+            ["ffmpeg", "-i", video_path, "-ar", "16000", "-ac", "1",
+             "-vn", audio_path, "-y"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        log.error(f"ffmpeg: {e}")
+        return False
+
+
+def transcribe(audio_path: str) -> str:
+    model = get_whisper()
+    segments, _ = model.transcribe(
+        audio_path,
+        language=None,
+        vad_filter=True,
+        beam_size=1,
+    )
+    return " ".join(seg.text for seg in segments).strip().lower()
+
+
+def count_67(text: str) -> int:
+    return len(PATTERN_67.findall(text))
+
+
+# =====================================================================
+# ЛИЦО (InsightFace)
+# =====================================================================
+
+def _decode_video_frames(video_path: str, max_frames: int = 5) -> list:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    step = max(1, total // max_frames)
+    frames, idx = [], 0
+    while len(frames) < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx % step == 0:
+            frames.append(frame)
+        idx += 1
+    cap.release()
+    return frames
+
+
+def _get_embedding(image_bgr: np.ndarray) -> Optional[np.ndarray]:
+    app = get_face_app()
+    faces = app.get(image_bgr)
+    if not faces:
+        return None
+    face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    return face.normed_embedding
+
+
+def _cos_sim(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+
+def get_face_from_photo(photo_path: str) -> Optional[bytes]:
+    img = cv2.imread(photo_path)
+    if img is None:
+        return None
+    emb = _get_embedding(img)
+    if emb is None:
+        return None
+    return emb.astype(np.float32).tobytes()
+
+
+def verify_video_face(
+    video_path: str,
+    stored_embedding_bytes: bytes,
+    threshold: float = 0.35,
+    max_frames: int = 5,
+) -> tuple:
+    if not stored_embedding_bytes:
+        return False, 0.0
+    stored = np.frombuffer(stored_embedding_bytes, dtype=np.float32)
+    frames = _decode_video_frames(video_path, max_frames=max_frames)
+    if not frames:
+        return False, 0.0
+    best = 0.0
+    for frame in frames:
+        emb = _get_embedding(frame)
+        if emb is None:
+            continue
+        sim = _cos_sim(emb, stored)
+        best = max(best, sim)
+        if sim >= threshold:
+            return True, sim
+    return False, best
+
+
+# =====================================================================
+# ЖЕСТЫ (MediaPipe Hands)
+# =====================================================================
+
+# =====================================================================
+# ЖЕСТЫ (MediaPipe Tasks API)
+# =====================================================================
+
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+from mediapipe import Image, ImageFormat
+
+_HAND_MODEL_PATH = "hand_landmarker.task"
+
+def _decode_frames_gesture(video_path: str, max_frames: int = 8) -> list:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    step = max(1, total // max_frames)
+    frames, idx = [], 0
+    while len(frames) < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx % step == 0:
+            frames.append(frame)
+        idx += 1
+    cap.release()
+    return frames
+
+def _count_extended(landmarks, handedness_label: str) -> list:
+    tips = [4, 8, 12, 16, 20]
+    pips = [3, 6, 10, 14, 18]
+    extended = []
+    # Thumb
+    if handedness_label == "Right":
+        extended.append(landmarks[tips[0]].x < landmarks[pips[0]].x)
+    else:
+        extended.append(landmarks[tips[0]].x > landmarks[pips[0]].x)
+    # Index..Pinky
+    for i in range(1, 5):
+        extended.append(landmarks[tips[i]].y < landmarks[pips[i]].y)
+    return extended
+
+def _match_6(ext: list) -> bool:
+    return ext[0] and ext[4] and not ext[1] and not ext[2] and not ext[3]
+
+def _match_7(ext: list) -> bool:
+    return ext[0] and ext[1] and ext[2] and not ext[3] and not ext[4]
+
+def check_gesture(video_path: str, strict: bool = False, max_frames: int = 8) -> tuple:
+    frames = _decode_frames_gesture(video_path, max_frames=max_frames)
+    if not frames:
+        return False, "нет кадров"
+
+    # Настраиваем HandLandmarker
+    base_options = mp_python.BaseOptions(model_asset_path=_HAND_MODEL_PATH)
+    options = vision.HandLandmarkerOptions(
+        base_options=base_options,
+        num_hands=2,
+        min_hand_detection_confidence=0.4,
+    )
+
+    found_6 = False
+    found_7 = False
+    hands_seen = 0
+
+    with vision.HandLandmarker.create_from_options(options) as landmarker:
+        for frame in frames:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
+            result = landmarker.detect(mp_image)
+
+            if not result.hand_landmarks:
+                continue
+
+            for lm, hand_cls in zip(result.hand_landmarks, result.handedness):
+                hands_seen += 1
+                label = hand_cls[0].category_name
+                ext = _count_extended(lm, label)
+
+                if _match_6(ext):
+                    found_6 = True
+                if _match_7(ext):
+                    found_7 = True
+                if not strict and any(ext[1:]):
+                    return True, "жест показан"
+
+    if found_6 and found_7:
+        return True, "показаны 6 и 7"
+    if found_6:
+        return True, "показана 6"
+    if found_7:
+        return True, "показана 7"
+
+    if strict:
+        return False, f"жест не распознан (рук: {hands_seen})"
+    return (hands_seen > 0, f"рук видно: {hands_seen}")
+
+# =====================================================================
+# РОУТЕР
+# =====================================================================
+
+router = Router()
+
+
+def get_level(balance: int) -> tuple:
+    levels = [
+        (0, "Новичок"),
+        (67, "Ученик"),
+        (670, "Практик"),
+        (6_700, "Мастер"),
+        (67_000, "Хранитель Баланса"),
+    ]
+    current = levels[0]
+    for threshold, name in levels:
+        if balance >= threshold:
+            current = (threshold, name)
+    return levels.index(current) + 1, current[1]
+
+
+def format_balance(user) -> str:
+    level_num, level_name = get_level(user["balance"])
+    face_status = "✅" if user["face_embedding"] else "❌"
+    return (
+        f"💰 Баланс: <b>{user['balance']} 67</b>\n"
+        f"🎯 Всего «67»: <b>{user['total_67']}</b>\n"
+        f"🔥 Стрик: <b>{user['streak']} дн.</b>\n"
+        f"🏅 Уровень {level_num}: <b>{level_name}</b>\n"
+        f"👤 Face ID: {face_status}"
+    )
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    await db_create_user(user_id, message.from_user.username)
+
+    today = date.today().isoformat()
+    user = await db_get_user(user_id)
+    bonus_text = ""
+
+    if user["last_login"] != today:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.execute(
+                "UPDATE users SET last_login = ?, streak = streak + 1, balance = balance + ? "
+                "WHERE user_id = ?",
+                (today, DAILY_LOGIN_BONUS, user_id),
+            )
+            await conn.commit()
+        bonus_text = f"\n🎁 Бонус за вход: <b>+{DAILY_LOGIN_BONUS} 67</b>"
+
+    text = (
+        "👋 <b>Добро пожаловать в 67 Note!</b>\n\n"
+        "Запиши кружок и скажи <b>«67»</b> — получи <b>1 монету 67 Coin</b>.\n\n"
+        "📜 <b>Правила:</b>\n"
+        f"• Длина кружка: {MIN_DURATION}–{MAX_DURATION} сек\n"
+        f"• Максимум {MAX_PER_VIDEO} «67» за кружок\n"
+        f"• Лимит: {DAILY_LIMIT} кружков в день\n"
+        f"• Бонус за {DAILY_LIMIT} монет за день: +{BONUS_67_PER_DAY}\n\n"
+        "🔐 <b>Перед игрой:</b>\n"
+        "1. Отправь селфи командой /register_face\n"
+        "2. Запиши кружок с голосом «67» и покажи жест рукой\n\n"
+        "📊 /balance — баланс\n"
+        "🏆 /top — топ игроков"
+        f"{bonus_text}"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("register_face"))
+async def cmd_register_face(message: Message):
+    await message.answer(
+        "📸 <b>Регистрация Face ID</b>\n\n"
+        "Отправь своё селфи <b>обычным фото</b> (не файлом).\n"
+        "Лицо должно быть хорошо видно, без очков и масок.\n\n"
+        "Это нужно, чтобы никто не мог записать кружок за тебя.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(F.photo)
+async def handle_photo(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    await db_create_user(user_id, message.from_user.username)
+
+    status = await message.answer("🔍 Обрабатываю фото...")
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "photo.jpg")
+        await bot.download_file(file.file_path, path)
+        loop = asyncio.get_running_loop()
+        embedding = await loop.run_in_executor(None, get_face_from_photo, path)
+
+    if embedding is None:
+        await status.edit_text(
+            "❌ Не смог найти лицо на фото. Попробуй ещё раз — "
+            "хорошее освещение, лицо крупно, без очков."
+        )
+        return
+
+    await db_save_face(user_id, embedding)
+    await status.edit_text(
+        "✅ <b>Face ID сохранён!</b>\n\n"
+        "Теперь можешь записывать кружки. При проверке лицо в видео "
+        "должно совпадать с этим фото.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@router.message(Command("balance", "bal"))
+async def cmd_balance(message: Message):
+    await db_create_user(message.from_user.id, message.from_user.username)
+    user = await db_get_user(message.from_user.id)
+    await message.answer(format_balance(user), parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("top"))
+async def cmd_top(message: Message):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT username, balance FROM users ORDER BY balance DESC LIMIT 67"
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await message.answer("Пока никто не играл. Будь первым!")
+        return
+
+    text = "🏆 <b>Топ-67 игроков:</b>\n\n"
+    for i, row in enumerate(rows, 1):
+        name = row["username"] or "аноним"
+        text += f"{i}. @{name} — <b>{row['balance']} 67</b>\n"
+
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+@router.message(F.video_note)
+async def handle_video_note(message: Message, bot: Bot):
+    user_id = message.from_user.id
+    await db_create_user(user_id, message.from_user.username)
+
+    vn = message.video_note
+    today = date.today().isoformat()
+
+    # 1. Длительность
+    if not (MIN_DURATION <= vn.duration <= MAX_DURATION):
+        await message.answer(
+            f"❌ Кружок должен быть {MIN_DURATION}–{MAX_DURATION} сек. "
+            f"У тебя — {vn.duration} сек."
+        )
+        return
+
+    # 2. Дубликат
+    if not await db_mark_video_seen(vn.file_unique_id, user_id):
+        await message.answer("❌ Этот кружок уже засчитан.")
+        return
+
+    # 3. Лимит
+    daily = await db_get_daily(user_id, today)
+    videos_today = daily["videos_count"] if daily else 0
+    if videos_today >= DAILY_LIMIT:
+        await message.answer(
+            f"⏰ Лимит на сегодня: {DAILY_LIMIT} кружков. Возвращайся завтра!"
+        )
+        return
+
+    # 4. Face ID обязателен?
+    stored_face = await db_get_face(user_id)
+    if REQUIRE_FACE_MATCH and not stored_face:
+        await message.answer("🔐 Сначала зарегистрируй лицо: /register_face")
+        return
+
+    status = await message.answer("🎧 Обрабатываю кружок...")
+
+    # Скачиваем видео
+    file = await bot.get_file(vn.file_id)
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = os.path.join(tmp, "note.mp4")
+        audio_path = os.path.join(tmp, "audio.wav")
+        await bot.download_file(file.file_path, video_path)
+
+        loop = asyncio.get_running_loop()
+        gesture_info = "—"
+
+        # === Лицо ===
+        if REQUIRE_FACE_MATCH and stored_face:
+            await status.edit_text("👤 Проверяю лицо...")
+            face_ok, similarity = await loop.run_in_executor(
+                None, verify_video_face, video_path, stored_face, FACE_THRESHOLD
+            )
+            if not face_ok:
+                await status.edit_text(
+                    f"❌ <b>Лицо не совпадает</b>\n\n"
+                    f"Схожесть: {similarity:.2f} (нужно ≥ {FACE_THRESHOLD}).\n"
+                    "Запиши кружок, где тебя хорошо видно.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+        # === Жест ===
+        if REQUIRE_GESTURE:
+            await status.edit_text("✋ Проверяю жест...")
+            gesture_ok, gesture_info = await loop.run_in_executor(
+                None, check_gesture, video_path, GESTURE_STRICT
+            )
+            if not gesture_ok:
+                await status.edit_text(
+                    f"❌ <b>Жест не распознан</b>\n\n"
+                    f"Детали: {gesture_info}\n"
+                    "Покажи пальцами «6» или «7» в кадре.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+        # === Аудио ===
+        await status.edit_text("🎙 Распознаю речь...")
+
+        def _audio_pipeline():
+            if not extract_audio(video_path, audio_path):
+                return ""
+            return transcribe(audio_path)
+
+        text = await loop.run_in_executor(None, _audio_pipeline)
+
+    log.info(f"user={user_id} text='{text}'")
+
+    if not text:
+        await status.edit_text("🤔 Не расслышал. Скажи «67» громче.")
+        return
+
+    hits = count_67(text)
+    if hits == 0:
+        await status.edit_text(
+            f"❌ Я не услышал «67».\n\n"
+            f"Распознано: <i>{text[:200]}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    hits = min(hits, MAX_PER_VIDEO)
+    coins = hits * COINS_PER_67
+
+    await db_add_coins(user_id, coins, count_67=hits)
+    await db_upsert_daily(user_id, today, videos=1, coins=coins)
+
+    daily = await db_get_daily(user_id, today)
+    bonus_text = ""
+    if daily["coins_earned"] >= BONUS_67_PER_DAY and daily["bonus_67"] == 0:
+        await db_add_coins(user_id, BONUS_67_PER_DAY)
+        await db_upsert_daily(user_id, today, bonus=BONUS_67_PER_DAY)
+        bonus_text = (
+            f"\n\n🎉 Бонус за {BONUS_67_PER_DAY} монет за день: "
+            f"<b>+{BONUS_67_PER_DAY} 67</b>!"
+        )
+
+    user = await db_get_user(user_id)
+    await status.edit_text(
+        f"✅ Услышал «67» × <b>{hits}</b>\n"
+        f"✋ Жест: {gesture_info if REQUIRE_GESTURE else '—'}\n"
+        f"👤 Лицо: подтверждено\n\n"
+        f"💰 Начислено: <b>+{coins} 67</b>\n"
+        f"📊 Баланс: <b>{user['balance']} 67</b>\n"
+        f"🎬 Кружков сегодня: {daily['videos_count']}/{DAILY_LIMIT}"
+        f"{bonus_text}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
+
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN не задан")
+
+    await init_db()
+
+    # Прогреваем модели в фоне, чтобы первый кружок обрабатывался быстро
+    get_whisper()
+    get_face_app()
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    log.info("Бот запущен. Polling...")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Бот остановлен.")
